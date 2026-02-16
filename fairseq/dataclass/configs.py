@@ -136,6 +136,22 @@ class CommonConfig(FairseqDataclass):
         default=None,
         metadata={"help": "Weights and Biases project name to use for logging"},
     )
+    mlflow_tracking_uri: Optional[str] = field(
+        default=None,
+        metadata={"help": "MLflow tracking URI (defaults to MLFLOW_TRACKING_URI/.env)"},
+    )
+    mlflow_experiment: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "MLflow experiment name (defaults to MLFLOW_EXPERIMENT_NAME/.env)"
+        },
+    )
+    mlflow_run_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "MLflow run name (defaults to MLFLOW_RUN_NAME/.env or save_dir basename)"
+        },
+    )
     azureml_logging: Optional[bool] = field(
         default=False,
         metadata={"help": "Log scalars to AzureML context"},

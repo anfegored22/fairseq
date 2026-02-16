@@ -1,5 +1,13 @@
 # UPS wav2vec2 pretraining
 
+Set these values in `.env` to enable direct MLflow logging during training (no extra flags needed):
+
+```bash
+MLFLOW_TRACKING_URI=file:///Users/andres/ups-challenge/fairseq/mlruns
+MLFLOW_EXPERIMENT_NAME=ups-w2v2
+MLFLOW_RUN_NAME=w2v2_ups_ps
+```
+
 Use this command to run a CPU smoke pretraining job on the UPS manifests and write TensorBoard logs.
 
 ```bash
@@ -21,6 +29,8 @@ uv run fairseq-hydra-train \
   common.tensorboard_logdir=/Users/andres/ups-challenge/fairseq/tb/w2v2_ups_ps
 ```
 
+When the MLflow vars above are present in your environment (or `.env`), the same run is logged directly to MLflow with split-aware metrics (`train/*` from `train_inner`, plus `valid/*`).
+
 Open TensorBoard in a second terminal:
 
 ```bash
@@ -37,7 +47,7 @@ uv pip install tensorboard
 ./scripts/log_w2v2_mlflow.sh
 ```
 
-This command uploads artifacts and syncs TensorBoard scalar points into MLflow metrics, so plots appear in the MLflow run Metrics tab. Metrics are logged as `train/*` and `valid/*`, while `train_inner/*` is skipped by default to keep curves clean.
+This command uploads artifacts and syncs TensorBoard scalar points into MLflow metrics, so plots appear in the MLflow run Metrics tab. It maps TensorBoard `train_inner/*` to MLflow `train/*` (dense step-level curves), keeps `valid/*`, and skips sparse epoch-level `train/*` to avoid duplicate-looking points.
 
 Open MLflow UI:
 

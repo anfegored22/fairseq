@@ -8,10 +8,12 @@ Wrapper around various loggers and progress bars (e.g., tqdm).
 """
 
 import atexit
+import getpass
 import json
 import logging
 import os
 import sys
+from urllib.parse import urlsplit, urlunsplit
 from collections import OrderedDict
 from contextlib import contextmanager
 from numbers import Number
@@ -22,6 +24,60 @@ import torch
 from .meters import AverageMeter, StopwatchMeter, TimeMeter
 
 logger = logging.getLogger(__name__)
+
+_DOTENV_CACHE = None
+
+
+def _parse_dotenv(path):
+    values = {}
+    if not os.path.exists(path):
+        return values
+
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                values[key] = value
+    return values
+
+
+def _get_env_or_dotenv(key):
+    val = os.environ.get(key)
+    if val:
+        return val
+
+    global _DOTENV_CACHE
+    if _DOTENV_CACHE is None:
+        _DOTENV_CACHE = _parse_dotenv(os.path.join(os.getcwd(), ".env"))
+    return _DOTENV_CACHE.get(key)
+
+
+def _sanitize_uri(uri):
+    if not uri:
+        return uri
+    parts = urlsplit(uri)
+    if "@" not in parts.netloc:
+        return uri
+    host = parts.netloc.split("@", 1)[1]
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
+def _resolve_mlflow_user():
+    return (
+        _get_env_or_dotenv("MLFLOW_TRACKING_USERNAME")
+        or _get_env_or_dotenv("MLFLOW_USER")
+        or os.environ.get("USER")
+        or getpass.getuser()
+    )
 
 
 def progress_bar(
@@ -38,6 +94,9 @@ def progress_bar(
     default_log_format: str = "tqdm",
     wandb_project: Optional[str] = None,
     wandb_run_name: Optional[str] = None,
+    mlflow_tracking_uri: Optional[str] = None,
+    mlflow_experiment: Optional[str] = None,
+    mlflow_run_name: Optional[str] = None,
     azureml_logging: Optional[bool] = False,
 ):
     if log_format is None:
@@ -81,6 +140,22 @@ def progress_bar(
 
     if wandb_project:
         bar = WandBProgressBarWrapper(bar, wandb_project, run_name=wandb_run_name)
+
+    mlflow_tracking_uri = mlflow_tracking_uri or _get_env_or_dotenv(
+        "MLFLOW_TRACKING_URI"
+    )
+    mlflow_experiment = mlflow_experiment or _get_env_or_dotenv(
+        "MLFLOW_EXPERIMENT_NAME"
+    )
+    mlflow_run_name = mlflow_run_name or _get_env_or_dotenv("MLFLOW_RUN_NAME")
+
+    if mlflow_tracking_uri or mlflow_experiment:
+        bar = MLflowProgressBarWrapper(
+            bar,
+            tracking_uri=mlflow_tracking_uri,
+            experiment=mlflow_experiment,
+            run_name=mlflow_run_name,
+        )
 
     if azureml_logging:
         bar = AzureMLProgressBarWrapper(bar)
@@ -481,6 +556,12 @@ except ImportError:
     wandb = None
 
 
+try:
+    import mlflow
+except ImportError:
+    mlflow = None
+
+
 class WandBProgressBarWrapper(BaseProgressBar):
     """Log to Weights & Biases."""
 
@@ -526,6 +607,81 @@ class WandBProgressBarWrapper(BaseProgressBar):
                 wandb.log({prefix + key: stats[key].val}, step=step)
             elif isinstance(stats[key], Number):
                 wandb.log({prefix + key: stats[key]}, step=step)
+
+
+class MLflowProgressBarWrapper(BaseProgressBar):
+    """Log to MLflow."""
+
+    def __init__(self, wrapped_bar, tracking_uri=None, experiment=None, run_name=None):
+        self.wrapped_bar = wrapped_bar
+        if mlflow is None:
+            logger.warning("mlflow not found, pip install mlflow")
+            return
+
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+        if experiment:
+            mlflow.set_experiment(experiment)
+
+        if mlflow.active_run() is None:
+            mlflow.start_run(run_name=run_name)
+
+        active = mlflow.active_run()
+        tracking = _sanitize_uri(mlflow.get_tracking_uri())
+        user = _resolve_mlflow_user()
+        run_id = active.info.run_id if active is not None else "unknown"
+
+        logger.info(
+            "MLflow logging enabled: uri=%s user=%s run_id=%s",
+            tracking,
+            user,
+            run_id,
+        )
+
+        if active is not None:
+            mlflow.set_tag("logger.user", user)
+            mlflow.set_tag("logger.tracking_uri", tracking)
+
+    def __iter__(self):
+        return iter(self.wrapped_bar)
+
+    def log(self, stats, tag=None, step=None):
+        self._log_to_mlflow(stats, tag, step)
+        self.wrapped_bar.log(stats, tag=tag, step=step)
+
+    def print(self, stats, tag=None, step=None):
+        self._log_to_mlflow(stats, tag, step)
+        self.wrapped_bar.print(stats, tag=tag, step=step)
+
+    def update_config(self, config):
+        if mlflow is not None:
+            mlflow.log_dict(config, "config.json")
+        self.wrapped_bar.update_config(config)
+
+    def _log_to_mlflow(self, stats, tag=None, step=None):
+        if mlflow is None:
+            return
+        if step is None:
+            step = stats["num_updates"]
+
+        split = tag or ""
+        if split == "train":
+            return
+        if split == "train_inner":
+            split = "train"
+
+        prefix = "" if split == "" else split + "/"
+        for key in stats.keys() - {"num_updates"}:
+            value = None
+            if isinstance(stats[key], AverageMeter):
+                value = stats[key].val
+            elif isinstance(stats[key], Number):
+                value = stats[key]
+            elif torch.is_tensor(stats[key]) and stats[key].numel() == 1:
+                value = stats[key].item()
+
+            if value is not None:
+                mlflow.log_metric(prefix + key, float(value), step=int(step))
 
 
 try:

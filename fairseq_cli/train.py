@@ -55,9 +55,9 @@ def main(cfg: FairseqConfig) -> None:
         # make hydra logging work with ddp (see # see https://github.com/facebookresearch/hydra/issues/1126)
         logging.config.dictConfig(OmegaConf.to_container(cfg.job_logging_cfg))
 
-    assert (
-        cfg.dataset.max_tokens is not None or cfg.dataset.batch_size is not None
-    ), "Must specify batch size either with --max-tokens or --batch-size"
+    assert cfg.dataset.max_tokens is not None or cfg.dataset.batch_size is not None, (
+        "Must specify batch size either with --max-tokens or --batch-size"
+    )
     metrics.reset()
 
     if cfg.common.log_file is not None:
@@ -182,7 +182,8 @@ def main(cfg: FairseqConfig) -> None:
         for subset in valid_subsets:
             logger.info('begin dry-run validation on "{}" subset'.format(subset))
             itr = trainer.get_valid_iterator(subset).next_epoch_itr(
-                shuffle=False, set_dataset_epoch=False  # use a fixed valid set
+                shuffle=False,
+                set_dataset_epoch=False,  # use a fixed valid set
             )
             if cfg.common.tpu:
                 itr = utils.tpu_data_loader(itr)
@@ -310,6 +311,21 @@ def train(
         wandb_run_name=os.environ.get(
             "WANDB_NAME", os.path.basename(cfg.checkpoint.save_dir)
         ),
+        mlflow_tracking_uri=(
+            cfg.common.mlflow_tracking_uri
+            if distributed_utils.is_master(cfg.distributed_training)
+            else None
+        ),
+        mlflow_experiment=(
+            cfg.common.mlflow_experiment
+            if distributed_utils.is_master(cfg.distributed_training)
+            else None
+        ),
+        mlflow_run_name=(
+            cfg.common.mlflow_run_name or os.path.basename(cfg.checkpoint.save_dir)
+            if distributed_utils.is_master(cfg.distributed_training)
+            else None
+        ),
         azureml_logging=(
             cfg.common.azureml_logging
             if distributed_utils.is_master(cfg.distributed_training)
@@ -325,8 +341,9 @@ def train(
     num_updates = trainer.get_num_updates()
     logger.info("Start iterating over samples")
     for i, samples in enumerate(progress):
-        with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
-            "train_step-%d" % i
+        with (
+            metrics.aggregate("train_inner"),
+            torch.autograd.profiler.record_function("train_step-%d" % i),
         ):
             log_output = trainer.train_step(samples)
 
@@ -473,7 +490,8 @@ def validate(
 
         # Initialize data iterator
         itr = trainer.get_valid_iterator(subset).next_epoch_itr(
-            shuffle=False, set_dataset_epoch=False  # use a fixed valid set
+            shuffle=False,
+            set_dataset_epoch=False,  # use a fixed valid set
         )
         if cfg.common.tpu:
             itr = utils.tpu_data_loader(itr)
@@ -507,6 +525,21 @@ def validate(
             ),
             wandb_run_name=os.environ.get(
                 "WANDB_NAME", os.path.basename(cfg.checkpoint.save_dir)
+            ),
+            mlflow_tracking_uri=(
+                cfg.common.mlflow_tracking_uri
+                if distributed_utils.is_master(cfg.distributed_training)
+                else None
+            ),
+            mlflow_experiment=(
+                cfg.common.mlflow_experiment
+                if distributed_utils.is_master(cfg.distributed_training)
+                else None
+            ),
+            mlflow_run_name=(
+                cfg.common.mlflow_run_name or os.path.basename(cfg.checkpoint.save_dir)
+                if distributed_utils.is_master(cfg.distributed_training)
+                else None
             ),
         )
 
@@ -553,7 +586,7 @@ def get_valid_stats(
 
 
 def cli_main(
-    modify_parser: Optional[Callable[[argparse.ArgumentParser], None]] = None
+    modify_parser: Optional[Callable[[argparse.ArgumentParser], None]] = None,
 ) -> None:
     parser = options.get_training_parser()
     args = options.parse_args_and_arch(parser, modify_parser=modify_parser)
