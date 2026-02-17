@@ -3,8 +3,35 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from fairseq import checkpoint_utils
+from fairseq.models.wav2vec import utils as w2v_utils
+from fairseq.models.wav2vec import wav2vec2 as w2v2_mod
+
+
+def _pad_to_multiple_compat(x, multiple, dim=-1, value=0):
+    if x is None:
+        return None, 0
+
+    tsz = x.size(dim)
+
+    # Compatible with Python ints and trace-time symbolic/tensor scalar sizes.
+    try:
+        remainder = int((-tsz) % multiple)
+    except TypeError:
+        remainder = int(((-tsz) % multiple).item())
+
+    if remainder == 0:
+        return x, 0
+
+    pad_offset = (0,) * (-1 - dim) * 2
+    return F.pad(x, (*pad_offset, 0, remainder), value=value), remainder
+
+
+# Patch wav2vec2 padding helper for torch.jit tracing compatibility.
+w2v_utils.pad_to_multiple = _pad_to_multiple_compat
+w2v2_mod.pad_to_multiple = _pad_to_multiple_compat
 
 
 class Wav2VecTorchScriptWrapper(torch.nn.Module):
@@ -20,17 +47,40 @@ class Wav2VecTorchScriptWrapper(torch.nn.Module):
 
     def forward(self, source: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         padding_mask = self._lengths_to_padding_mask(lengths, source.size(1))
-        net_output = self.model(source=source, padding_mask=padding_mask)
+        transpose_tbc_to_btc = False
+        # Disable training-time masking to avoid tracing through NumPy-based
+        # mask index generation in wav2vec2 pretraining models.
+        try:
+            net_output = self.model(
+                source=source,
+                padding_mask=padding_mask,
+                mask=False,
+                features_only=True,
+            )
 
-        if hasattr(self.model, "get_logits"):
-            logits = self.model.get_logits(net_output, normalize=False)
-        else:
-            logits = net_output["encoder_out"]
+            if "x" in net_output:
+                logits = net_output["x"]
+            elif hasattr(self.model, "get_logits"):
+                logits = self.model.get_logits(net_output, normalize=False)
+                transpose_tbc_to_btc = True
+            else:
+                logits = net_output["encoder_out"]
+                transpose_tbc_to_btc = True
+        except TypeError:
+            # Fallback path for checkpoints whose forward does not accept
+            # mask/features_only kwargs.
+            net_output = self.model(source=source, padding_mask=padding_mask)
+            if hasattr(self.model, "get_logits"):
+                logits = self.model.get_logits(net_output, normalize=False)
+                transpose_tbc_to_btc = True
+            else:
+                logits = net_output["encoder_out"]
+                transpose_tbc_to_btc = True
 
         if isinstance(logits, list):
             logits = logits[0]
 
-        if logits.dim() == 3 and logits.size(1) == source.size(0):
+        if transpose_tbc_to_btc and logits.dim() == 3:
             logits = logits.transpose(0, 1)
 
         return logits
@@ -87,6 +137,11 @@ def main() -> None:
         raise RuntimeError(f"Expected one model, got {len(models)}")
 
     base_model = models[0].to(device).eval()
+    # Avoid non-scriptable custom autograd op GradMultiply during export.
+    for module in base_model.modules():
+        if hasattr(module, "feature_grad_mult"):
+            module.feature_grad_mult = 1.0
+
     wrapped = Wav2VecTorchScriptWrapper(base_model).to(device).eval()
 
     dummy_source = torch.randn(args.batch_size, args.sample_length, device=device)
@@ -101,10 +156,14 @@ def main() -> None:
         scripted = torch.jit.trace(wrapped, (dummy_source, dummy_lengths), strict=False)
         scripted = torch.jit.freeze(scripted)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    scripted.save(str(args.output))
+    output_path = args.output
+    if output_path.exists() and output_path.is_dir():
+        output_path = output_path / "model.ts"
 
-    print(f"Saved TorchScript model to: {args.output}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scripted.save(str(output_path))
+
+    print(f"Saved TorchScript model to: {output_path}")
 
 
 if __name__ == "__main__":
