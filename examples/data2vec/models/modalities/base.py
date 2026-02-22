@@ -629,17 +629,21 @@ class ModalitySpecificEncoder(nn.Module):
             decay = self.modality_cfg.mask_cluster_loss_ema_decay
 
             if not self.mask_cluster_loss_ready:
-                self.mask_cluster_loss_ema[seen_loss] = batch_avg[seen_loss]
-                self.mask_cluster_count_ema[seen_loss] = cluster_loss_cnt[seen_loss]
+                self.mask_cluster_loss_ema[seen_loss] = batch_avg[seen_loss].to(
+                    self.mask_cluster_loss_ema.dtype
+                )
+                self.mask_cluster_count_ema[seen_loss] = cluster_loss_cnt[seen_loss].to(
+                    self.mask_cluster_count_ema.dtype
+                )
             else:
                 self.mask_cluster_loss_ema[seen_loss] = (
                     decay * self.mask_cluster_loss_ema[seen_loss]
                     + (1 - decay) * batch_avg[seen_loss]
-                )
+                ).to(self.mask_cluster_loss_ema.dtype)
                 self.mask_cluster_count_ema[seen_loss] = (
                     decay * self.mask_cluster_count_ema[seen_loss]
                     + (1 - decay) * cluster_loss_cnt[seen_loss]
-                )
+                ).to(self.mask_cluster_count_ema.dtype)
 
             self.mask_cluster_loss_ready = True
 
