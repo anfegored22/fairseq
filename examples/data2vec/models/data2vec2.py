@@ -269,7 +269,6 @@ class Data2VecMultiModel(BaseFairseqModel):
         self.num_updates = 0
 
     def _init_weights(self, m):
-
         try:
             from apex.normalization import FusedLayerNorm
 
@@ -650,17 +649,22 @@ class Data2VecMultiModel(BaseFairseqModel):
                 result["losses"][n] = reg_loss * self.cfg.d2v_loss
                 token_losses.append(self.d2v_loss_per_token(x, y))
 
-            if (
-                self.training
-                and encoder_mask is not None
-                and len(token_losses) > 0
-                and hasattr(feature_extractor, "update_mask_loss_bins")
-            ):
+            if self.training and encoder_mask is not None and len(token_losses) > 0:
                 avg_token_loss = torch.stack(token_losses, dim=0).mean(0)
+                token_features = extractor_out["local_features"]
+                if self.cfg.clone_batch > 1:
+                    token_features = token_features.repeat_interleave(
+                        self.cfg.clone_batch,
+                        0,
+                    )
+
+                token_padding_mask = extractor_out.get("encoder_padding_mask")
                 result.setdefault("logs", {}).update(
-                    feature_extractor.update_mask_loss_bins(
+                    feature_extractor.update_mask_loss_clusters(
                         encoder_mask.mask,
                         avg_token_loss,
+                        token_features,
+                        token_padding_mask,
                     )
                 )
 
@@ -742,7 +746,6 @@ class Data2VecMultiModel(BaseFairseqModel):
         return reg_loss.mean(dim=-1)
 
     def make_targets(self, y, num_layers):
-
         with torch.no_grad():
             target_layer_results = y[-num_layers:]
 

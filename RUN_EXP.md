@@ -3,7 +3,7 @@ uv run fairseq-hydra-train \
   --config-dir examples/data2vec/config/v2 \
   --config-name ups_audio_curriculum_local \
   task.data=/Users/andres/ups-challenge/fairseq/data/ups_ps/manifests \
-  model.modalities.audio.mask_loss_bins=0 \
+  model.modalities.audio.mask_cluster_count=0 \
   dataset.train_subset=train \
   dataset.valid_subset=valid \
   checkpoint.finetune_from_model=/Users/andres/Downloads/base_libri.pt\
@@ -16,7 +16,7 @@ PYTHONPATH=. uv run --env-file .env fairseq-hydra-train \
   --config-dir examples/data2vec/config/v2 \
   --config-name ups_audio_no_curriculum.yaml\
   task.data=/Users/andres/ups-challenge/fairseq/data/ups_ps/manifests \
-  model.modalities.audio.mask_loss_bins=0 \
+  model.modalities.audio.mask_cluster_count=0 \
   dataset.train_subset=train \
   dataset.valid_subset=valid \
   checkpoint.finetune_from_model=/Users/andres/Downloads/base_libri.pt\
@@ -34,7 +34,7 @@ PYTHONPATH=. uv run --env-file .env fairseq-hydra-train \
   checkpoint.finetune_from_model=/Users/andres/Downloads/base_libri.pt\
   common.mlflow_experiment=data2vec2\
   common.mlflow_run_name=d2v2_curriculum_masking\
-  model.modalities.audio.mask_loss_ema_decay=0.6 \
+  model.modalities.audio.mask_cluster_loss_ema_decay=0.6 \
   common.log_interval=1
 
 

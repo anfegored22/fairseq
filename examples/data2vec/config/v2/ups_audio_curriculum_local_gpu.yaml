@@ -100,11 +100,12 @@ model:
       mask_prob_end: 0.65
       mask_prob_warmup_updates: 100
       mask_prob_schedule: cosine
-      mask_loss_bins: 20
-      mask_loss_ema_decay: 0.99
-      mask_loss_warmup_updates: 50
-      mask_loss_easy_to_hard_updates: 200
-      mask_loss_explore_pct: 0.15
+      mask_cluster_count: 20
+      mask_cluster_loss_ema_decay: 0.99
+      mask_cluster_center_ema_decay: 0.99
+      mask_cluster_warmup_updates: 50
+      mask_cluster_easy_to_hard_updates: 200
+      mask_cluster_explore_pct: 0.15
 
       mask_prob_adjust: 0.05
       inverse_mask: false

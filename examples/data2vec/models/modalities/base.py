@@ -46,11 +46,12 @@ class D2vModalityConfig:
     inverse_mask: bool = False
     mask_prob_adjust: float = 0
     keep_masked_pct: float = 0
-    mask_loss_bins: int = 0
-    mask_loss_ema_decay: float = 0.99
-    mask_loss_warmup_updates: int = 0
-    mask_loss_easy_to_hard_updates: int = 0
-    mask_loss_explore_pct: float = 0.1
+    mask_cluster_count: int = 0
+    mask_cluster_loss_ema_decay: float = 0.99
+    mask_cluster_center_ema_decay: float = 0.99
+    mask_cluster_warmup_updates: int = 0
+    mask_cluster_easy_to_hard_updates: int = 0
+    mask_cluster_explore_pct: float = 0.1
 
     mask_length: int = 5
     mask_length_start: Optional[int] = None
@@ -162,19 +163,36 @@ class ModalitySpecificEncoder(nn.Module):
         self.current_mask_length = self.modality_cfg.mask_length
         self.current_num_updates = 0
 
-        self.mask_loss_bins_ready = False
-        if self._mask_loss_curriculum_enabled():
-            bins = self.modality_cfg.mask_loss_bins
+        self.mask_cluster_centers_ready = False
+        self.mask_cluster_loss_ready = False
+        if self._mask_curriculum_enabled():
+            num_clusters = self.modality_cfg.mask_cluster_count
             self.register_buffer(
-                "mask_loss_bin_ema",
-                torch.zeros(bins, dtype=torch.float),
+                "mask_cluster_loss_ema",
+                torch.zeros(num_clusters, dtype=torch.float),
                 persistent=False,
             )
             self.register_buffer(
-                "mask_loss_bin_count",
-                torch.zeros(bins, dtype=torch.float),
+                "mask_cluster_count_ema",
+                torch.zeros(num_clusters, dtype=torch.float),
                 persistent=False,
             )
+
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(0)
+            cluster_centers = torch.randn(
+                num_clusters,
+                embed_dim,
+                generator=generator,
+                dtype=torch.float,
+            )
+            cluster_centers = F.normalize(cluster_centers, dim=-1)
+            self.register_buffer(
+                "mask_cluster_centers",
+                cluster_centers,
+                persistent=False,
+            )
+            self.mask_cluster_centers_ready = True
 
     def upgrade_state_dict_named(self, state_dict, name):
         k = f"{name}.alibi_scale"
@@ -243,7 +261,6 @@ class ModalitySpecificEncoder(nn.Module):
         mask_seeds: Optional[torch.Tensor] = None,
         precomputed_mask=None,
     ):
-
         if padding_mask is not None:
             padding_mask = self.convert_padding_mask(x, padding_mask)
 
@@ -352,6 +369,7 @@ class ModalitySpecificEncoder(nn.Module):
         return {
             "x": x,
             "local_features": local_features,
+            "encoder_padding_mask": padding_mask,
             "padding_mask": masked_padding_mask,
             "alibi_bias": alibi_bias,
             "alibi_scale": alibi_scale[self.modality_cfg.prenet_depth :]
@@ -443,37 +461,37 @@ class ModalitySpecificEncoder(nn.Module):
         else:
             self.current_mask_length = cfg.mask_length
 
-    def _mask_loss_curriculum_enabled(self):
+    def _mask_curriculum_enabled(self):
         return (
             self.modality_cfg.type == Modality.AUDIO
-            and self.modality_cfg.mask_loss_bins is not None
-            and self.modality_cfg.mask_loss_bins > 1
+            and self.modality_cfg.mask_cluster_count is not None
+            and self.modality_cfg.mask_cluster_count > 1
         )
 
-    def _mask_loss_curriculum_progress(self):
+    def _mask_curriculum_progress(self):
         cfg = self.modality_cfg
-        if not self._mask_loss_curriculum_enabled():
+        if not self._mask_curriculum_enabled():
             return 0.0
 
-        start = cfg.mask_loss_warmup_updates
+        start = cfg.mask_cluster_warmup_updates
         if self.current_num_updates <= start:
             return 0.0
 
-        ramp = cfg.mask_loss_easy_to_hard_updates
+        ramp = cfg.mask_cluster_easy_to_hard_updates
         if ramp <= 0:
             return 1.0
 
         return min(1.0, (self.current_num_updates - start) / ramp)
 
-    def _mask_loss_bin_weights(self, device, dtype):
-        bins = self.modality_cfg.mask_loss_bins
-        weights = torch.ones(bins, device=device, dtype=dtype)
+    def _mask_cluster_weights(self, device, dtype):
+        num_clusters = self.modality_cfg.mask_cluster_count
+        weights = torch.ones(num_clusters, device=device, dtype=dtype)
 
-        if not self.mask_loss_bins_ready:
+        if not self.mask_cluster_loss_ready:
             return weights / weights.sum()
 
-        loss = self.mask_loss_bin_ema.to(device=device, dtype=dtype)
-        seen = self.mask_loss_bin_count.to(device=device) > 0
+        loss = self.mask_cluster_loss_ema.to(device=device, dtype=dtype)
+        seen = self.mask_cluster_count_ema.to(device=device) > 0
         if seen.any() and (~seen).any():
             loss = torch.where(seen, loss, loss[seen].mean())
 
@@ -483,7 +501,7 @@ class ModalitySpecificEncoder(nn.Module):
             return weights / weights.sum()
 
         difficulty = (loss - lo) / (hi - lo)
-        progress = self._mask_loss_curriculum_progress()
+        progress = self._mask_curriculum_progress()
         easy = 1 - difficulty
         hard = difficulty
         weights = (1 - progress) * easy + progress * hard
@@ -491,94 +509,183 @@ class ModalitySpecificEncoder(nn.Module):
         return weights / weights.sum()
 
     @torch.no_grad()
-    def update_mask_loss_bins(self, mask: torch.Tensor, token_loss: torch.Tensor):
-        if not self._mask_loss_curriculum_enabled():
+    def _assign_mask_clusters(self, token_features: torch.Tensor):
+        if token_features is None or token_features.dim() != 3:
+            return None
+
+        B, T, D = token_features.shape
+        if (
+            D != self.mask_cluster_centers.size(1)
+            or not self.mask_cluster_centers_ready
+        ):
+            return None
+
+        features = F.normalize(token_features.detach().float().view(-1, D), dim=-1)
+        centers = self.mask_cluster_centers.to(
+            device=features.device,
+            dtype=features.dtype,
+        )
+        centers = F.normalize(centers, dim=-1)
+        sim = torch.matmul(features, centers.transpose(0, 1))
+        return sim.argmax(dim=-1).view(B, T)
+
+    @torch.no_grad()
+    def update_mask_loss_clusters(
+        self,
+        mask: torch.Tensor,
+        token_loss: torch.Tensor,
+        token_features: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        if not self._mask_curriculum_enabled():
             return {}
-        if mask is None or token_loss is None or token_loss.numel() == 0:
+        if mask is None or token_features is None:
             return self.get_mask_curriculum_logs()
 
         mask = mask.bool()
-        B, T = mask.shape
+        if token_features.dim() != 3:
+            return self.get_mask_curriculum_logs()
 
-        flat_count = int(mask.sum().item())
+        B, T = mask.shape
+        if token_features.size(0) != B or token_features.size(1) != T:
+            return self.get_mask_curriculum_logs()
+
+        if padding_mask is not None:
+            if padding_mask.size(0) != B or padding_mask.size(1) != T:
+                return self.get_mask_curriculum_logs()
+            valid = ~padding_mask.bool()
+        else:
+            valid = torch.ones_like(mask, dtype=torch.bool)
+
+        cluster_ids = self._assign_mask_clusters(token_features)
+        if cluster_ids is None:
+            return self.get_mask_curriculum_logs()
+
+        num_clusters = self.modality_cfg.mask_cluster_count
+        token_features = F.normalize(token_features.detach().float(), dim=-1)
+
+        flat_valid = valid.view(-1)
+        valid_clusters = cluster_ids.view(-1)[flat_valid]
+        valid_features = token_features.view(-1, token_features.size(-1))[flat_valid]
+
+        if valid_features.numel() > 0:
+            center_sum = valid_features.new_zeros(
+                (num_clusters, valid_features.size(-1)),
+            )
+            center_sum.index_add_(0, valid_clusters, valid_features)
+            center_cnt = torch.bincount(valid_clusters, minlength=num_clusters).float()
+
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(center_sum)
+                dist.all_reduce(center_cnt)
+
+            seen_centers = center_cnt > 0
+            if seen_centers.any():
+                batch_centers = center_sum.new_zeros(center_sum.shape)
+                batch_centers[seen_centers] = center_sum[seen_centers] / center_cnt[
+                    seen_centers
+                ].unsqueeze(-1)
+                batch_centers = F.normalize(batch_centers, dim=-1)
+
+                decay = self.modality_cfg.mask_cluster_center_ema_decay
+                updated = (
+                    decay * self.mask_cluster_centers[seen_centers]
+                    + (1 - decay) * batch_centers[seen_centers]
+                )
+                self.mask_cluster_centers[seen_centers] = F.normalize(updated, dim=-1)
+                self.mask_cluster_centers_ready = True
+
+        if token_loss is None or token_loss.numel() == 0:
+            return self.get_mask_curriculum_logs()
+
+        masked_valid = mask & valid
+        flat_count = int(masked_valid.sum().item())
         token_loss = token_loss.detach().float().view(-1)
         if flat_count == 0 or token_loss.numel() != flat_count:
             return self.get_mask_curriculum_logs()
 
-        bins = self.modality_cfg.mask_loss_bins
-        pos = torch.arange(T, device=mask.device)
-        bin_ids = torch.clamp((pos * bins) // max(T, 1), max=bins - 1)
-        flat_bins = bin_ids.unsqueeze(0).expand(B, -1)[mask]
-
-        bin_sum = torch.bincount(flat_bins, weights=token_loss, minlength=bins).float()
-        bin_cnt = torch.bincount(flat_bins, minlength=bins).float()
+        masked_clusters = cluster_ids[masked_valid]
+        cluster_loss_sum = torch.bincount(
+            masked_clusters,
+            weights=token_loss,
+            minlength=num_clusters,
+        ).float()
+        cluster_loss_cnt = torch.bincount(
+            masked_clusters, minlength=num_clusters
+        ).float()
 
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(bin_sum)
-            dist.all_reduce(bin_cnt)
+            dist.all_reduce(cluster_loss_sum)
+            dist.all_reduce(cluster_loss_cnt)
 
-        seen = bin_cnt > 0
-        if seen.any():
-            batch_avg = torch.zeros_like(bin_sum)
-            batch_avg[seen] = bin_sum[seen] / bin_cnt[seen]
-            decay = self.modality_cfg.mask_loss_ema_decay
+        seen_loss = cluster_loss_cnt > 0
+        if seen_loss.any():
+            batch_avg = torch.zeros_like(cluster_loss_sum)
+            batch_avg[seen_loss] = (
+                cluster_loss_sum[seen_loss] / cluster_loss_cnt[seen_loss]
+            )
+            decay = self.modality_cfg.mask_cluster_loss_ema_decay
 
-            if not self.mask_loss_bins_ready:
-                self.mask_loss_bin_ema[seen] = batch_avg[seen]
-                self.mask_loss_bin_count[seen] = bin_cnt[seen]
+            if not self.mask_cluster_loss_ready:
+                self.mask_cluster_loss_ema[seen_loss] = batch_avg[seen_loss]
+                self.mask_cluster_count_ema[seen_loss] = cluster_loss_cnt[seen_loss]
             else:
-                self.mask_loss_bin_ema[seen] = (
-                    decay * self.mask_loss_bin_ema[seen] + (1 - decay) * batch_avg[seen]
+                self.mask_cluster_loss_ema[seen_loss] = (
+                    decay * self.mask_cluster_loss_ema[seen_loss]
+                    + (1 - decay) * batch_avg[seen_loss]
                 )
-                self.mask_loss_bin_count[seen] = (
-                    decay * self.mask_loss_bin_count[seen] + (1 - decay) * bin_cnt[seen]
+                self.mask_cluster_count_ema[seen_loss] = (
+                    decay * self.mask_cluster_count_ema[seen_loss]
+                    + (1 - decay) * cluster_loss_cnt[seen_loss]
                 )
 
-            self.mask_loss_bins_ready = True
+            self.mask_cluster_loss_ready = True
 
         return self.get_mask_curriculum_logs()
 
     @torch.no_grad()
     def get_mask_curriculum_logs(self):
-        if not self._mask_loss_curriculum_enabled():
+        if not self._mask_curriculum_enabled():
             return {}
 
         logs = {
-            "mask_curriculum_progress": self._mask_loss_curriculum_progress(),
-            "mask_curriculum_ready": 1.0 if self.mask_loss_bins_ready else 0.0,
+            "mask_curriculum_progress": self._mask_curriculum_progress(),
+            "mask_curriculum_ready": 1.0 if self.mask_cluster_loss_ready else 0.0,
         }
 
-        if self.mask_loss_bins_ready:
-            loss = self.mask_loss_bin_ema
-            logs["mask_curriculum_bin_loss_min"] = float(loss.min().item())
-            logs["mask_curriculum_bin_loss_max"] = float(loss.max().item())
+        if self.mask_cluster_loss_ready:
+            loss = self.mask_cluster_loss_ema
+            logs["mask_curriculum_cluster_loss_min"] = float(loss.min().item())
+            logs["mask_curriculum_cluster_loss_max"] = float(loss.max().item())
+            seen = self.mask_cluster_count_ema > 0
+            logs["mask_curriculum_cluster_seen_pct"] = float(
+                seen.float().mean().item() * 100.0
+            )
 
         return logs
 
     def _compute_curriculum_mask(
         self,
-        B,
-        T,
-        device,
+        x,
         padding_mask,
         mask_prob,
         mask_length,
     ):
         cfg = self.modality_cfg
+        B, T, _ = x.shape
         mask = torch.zeros(
             (B, T),
             dtype=torch.bool,
-            device=device,
+            device=x.device,
         )
 
-        pos_weights = self._mask_loss_bin_weights(mask.device, torch.float)
-        bin_ids = torch.clamp(
-            (torch.arange(T, device=mask.device) * cfg.mask_loss_bins) // max(T, 1),
-            max=cfg.mask_loss_bins - 1,
-        )
-        pos_weights = pos_weights[bin_ids]
+        cluster_ids = self._assign_mask_clusters(x)
+        if cluster_ids is None:
+            return mask
 
-        explore = max(0.0, min(1.0, cfg.mask_loss_explore_pct))
+        cluster_weights = self._mask_cluster_weights(mask.device, torch.float)
+        token_weights = cluster_weights[cluster_ids]
+        explore = max(0.0, min(1.0, cfg.mask_cluster_explore_pct))
 
         for i in range(B):
             valid_len = T
@@ -594,7 +701,7 @@ class ModalitySpecificEncoder(nn.Module):
                 continue
 
             m = torch.zeros(valid_len, dtype=torch.bool, device=mask.device)
-            w = pos_weights[:valid_len]
+            w = token_weights[i, :valid_len].clamp_min(1.0e-8)
 
             if mask_length <= 1:
                 probs = w / w.sum()
@@ -693,19 +800,17 @@ class ModalitySpecificEncoder(nn.Module):
                 if mask_length == 1:
                     mask_info = random_masking(x, mask_prob, mask_seed)
                 else:
-                    use_loss_curriculum = (
-                        self._mask_loss_curriculum_enabled()
-                        and self.current_num_updates >= cfg.mask_loss_warmup_updates
+                    use_mask_curriculum = (
+                        self._mask_curriculum_enabled()
+                        and self.current_num_updates >= cfg.mask_cluster_warmup_updates
                     )
 
                     if self.modality_cfg.inverse_mask:
                         mask_prob = 1 - mask_prob
 
-                    if use_loss_curriculum:
+                    if use_mask_curriculum:
                         mask = self._compute_curriculum_mask(
-                            B,
-                            T,
-                            x.device,
+                            x,
                             padding_mask,
                             mask_prob,
                             mask_length,
