@@ -592,7 +592,9 @@ class ModalitySpecificEncoder(nn.Module):
                     decay * self.mask_cluster_centers[seen_centers]
                     + (1 - decay) * batch_centers[seen_centers]
                 )
-                self.mask_cluster_centers[seen_centers] = F.normalize(updated, dim=-1)
+                self.mask_cluster_centers[seen_centers] = F.normalize(
+                    updated, dim=-1
+                ).to(self.mask_cluster_centers.dtype)
                 self.mask_cluster_centers_ready = True
 
         if token_loss is None or token_loss.numel() == 0:
