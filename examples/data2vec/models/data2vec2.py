@@ -61,7 +61,6 @@ class D2vModalitiesConfig(FairseqDataclass):
 
 @dataclass
 class Data2VecMultiConfig(FairseqDataclass):
-
     loss_beta: float = field(
         default=0, metadata={"help": "beta for smooth l1 loss. 0 means use l2 loss"}
     )
@@ -623,7 +622,6 @@ class Data2VecMultiModel(BaseFairseqModel):
             )
 
         if self.cfg.recon_loss > 0:
-
             with torch.no_grad():
                 target = feature_extractor.patchify(source)
                 mean = target.mean(dim=-1, keepdim=True)
@@ -645,10 +643,26 @@ class Data2VecMultiModel(BaseFairseqModel):
             )
 
         if self.cfg.d2v_loss > 0:
+            token_losses = []
             for i, x in enumerate(xs):
                 reg_loss = self.d2v_loss(x, y)
                 n = f"{mode}_regression_{i}" if len(xs) > 1 else f"{mode}_regression"
                 result["losses"][n] = reg_loss * self.cfg.d2v_loss
+                token_losses.append(self.d2v_loss_per_token(x, y))
+
+            if (
+                self.training
+                and encoder_mask is not None
+                and len(token_losses) > 0
+                and hasattr(feature_extractor, "update_mask_loss_bins")
+            ):
+                avg_token_loss = torch.stack(token_losses, dim=0).mean(0)
+                result.setdefault("logs", {}).update(
+                    feature_extractor.update_mask_loss_bins(
+                        encoder_mask.mask,
+                        avg_token_loss,
+                    )
+                )
 
         suffix = "" if len(self.modalities) == 1 else f"_{mode}"
         with torch.no_grad():
@@ -662,6 +676,11 @@ class Data2VecMultiModel(BaseFairseqModel):
             if self.ema is not None:
                 for k, v in self.ema.logs.items():
                     result[k] = v
+
+            if hasattr(feature_extractor, "get_mask_curriculum_logs"):
+                result.setdefault("logs", {}).update(
+                    feature_extractor.get_mask_curriculum_logs()
+                )
 
             y = y.float()
             result[f"target_var{suffix}"] = self.compute_var(y)
@@ -718,6 +737,10 @@ class Data2VecMultiModel(BaseFairseqModel):
 
         return reg_loss
 
+    def d2v_loss_per_token(self, x, y):
+        reg_loss = self.d2v_loss(x, y)
+        return reg_loss.mean(dim=-1)
+
     def make_targets(self, y, num_layers):
 
         with torch.no_grad():
@@ -726,7 +749,8 @@ class Data2VecMultiModel(BaseFairseqModel):
             permuted = False
             if self.cfg.instance_norm_target_layer or self.cfg.batch_norm_target_layer:
                 target_layer_results = [
-                    tl.transpose(1, 2) for tl in target_layer_results  # BTC -> BCT
+                    tl.transpose(1, 2)
+                    for tl in target_layer_results  # BTC -> BCT
                 ]
                 permuted = True
             if self.cfg.batch_norm_target_layer:
@@ -742,7 +766,8 @@ class Data2VecMultiModel(BaseFairseqModel):
                 ]
             if permuted:
                 target_layer_results = [
-                    tl.transpose(1, 2) for tl in target_layer_results  # BCT -> BTC
+                    tl.transpose(1, 2)
+                    for tl in target_layer_results  # BCT -> BTC
                 ]
             if self.cfg.layer_norm_target_layer:
                 target_layer_results = [

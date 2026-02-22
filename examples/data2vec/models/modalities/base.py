@@ -7,6 +7,7 @@ import logging
 import math
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import namedtuple
@@ -38,11 +39,23 @@ class D2vModalityConfig:
     mask_noise_std: float = 0.01
     mask_prob_min: Optional[float] = None
     mask_prob: float = 0.7
+    mask_prob_start: Optional[float] = None
+    mask_prob_end: Optional[float] = None
+    mask_prob_warmup_updates: int = 0
+    mask_prob_schedule: str = "linear"
     inverse_mask: bool = False
     mask_prob_adjust: float = 0
     keep_masked_pct: float = 0
+    mask_loss_bins: int = 0
+    mask_loss_ema_decay: float = 0.99
+    mask_loss_warmup_updates: int = 0
+    mask_loss_easy_to_hard_updates: int = 0
+    mask_loss_explore_pct: float = 0.1
 
     mask_length: int = 5
+    mask_length_start: Optional[int] = None
+    mask_length_end: Optional[int] = None
+    mask_length_warmup_updates: int = 0
     add_masks: bool = False
     remove_masks: bool = False
     mask_dropout: float = 0.0
@@ -143,6 +156,24 @@ class ModalitySpecificEncoder(nn.Module):
             self.alibi_bias = nn.Parameter(alibi_bias)
             self.get_alibi_bias = partial(
                 _learned_alibi_bias, alibi_bias=self.alibi_bias
+            )
+
+        self.current_mask_prob = self.modality_cfg.mask_prob
+        self.current_mask_length = self.modality_cfg.mask_length
+        self.current_num_updates = 0
+
+        self.mask_loss_bins_ready = False
+        if self._mask_loss_curriculum_enabled():
+            bins = self.modality_cfg.mask_loss_bins
+            self.register_buffer(
+                "mask_loss_bin_ema",
+                torch.zeros(bins, dtype=torch.float),
+                persistent=False,
+            )
+            self.register_buffer(
+                "mask_loss_bin_count",
+                torch.zeros(bins, dtype=torch.float),
+                persistent=False,
             )
 
     def upgrade_state_dict_named(self, state_dict, name):
@@ -353,6 +384,286 @@ class ModalitySpecificEncoder(nn.Module):
     def reset_parameters(self):
         pass
 
+    def _anneal(self, start, end, curr_step, total_steps):
+        if total_steps <= 0 or curr_step >= total_steps:
+            return end
+        if curr_step <= 0:
+            return start
+        pct = curr_step / total_steps
+        return start + (end - start) * pct
+
+    def _anneal_cosine(self, start, end, curr_step, total_steps):
+        if total_steps <= 0 or curr_step >= total_steps:
+            return end
+        if curr_step <= 0:
+            return start
+        return end + 0.5 * (start - end) * (
+            1 + math.cos(math.pi * curr_step / total_steps)
+        )
+
+    def set_num_updates(self, num_updates):
+        cfg = self.modality_cfg
+        self.current_num_updates = num_updates
+
+        if (
+            cfg.mask_prob_start is not None
+            and cfg.mask_prob_end is not None
+            and cfg.mask_prob_warmup_updates > 0
+        ):
+            if cfg.mask_prob_schedule == "cosine":
+                self.current_mask_prob = self._anneal_cosine(
+                    cfg.mask_prob_start,
+                    cfg.mask_prob_end,
+                    num_updates,
+                    cfg.mask_prob_warmup_updates,
+                )
+            else:
+                self.current_mask_prob = self._anneal(
+                    cfg.mask_prob_start,
+                    cfg.mask_prob_end,
+                    num_updates,
+                    cfg.mask_prob_warmup_updates,
+                )
+        else:
+            self.current_mask_prob = cfg.mask_prob
+        self.current_mask_prob = max(0.0, min(1.0, self.current_mask_prob))
+
+        if (
+            cfg.mask_length_start is not None
+            and cfg.mask_length_end is not None
+            and cfg.mask_length_warmup_updates > 0
+        ):
+            curr_mask_length = self._anneal(
+                cfg.mask_length_start,
+                cfg.mask_length_end,
+                num_updates,
+                cfg.mask_length_warmup_updates,
+            )
+            self.current_mask_length = max(1, int(round(curr_mask_length)))
+        else:
+            self.current_mask_length = cfg.mask_length
+
+    def _mask_loss_curriculum_enabled(self):
+        return (
+            self.modality_cfg.type == Modality.AUDIO
+            and self.modality_cfg.mask_loss_bins is not None
+            and self.modality_cfg.mask_loss_bins > 1
+        )
+
+    def _mask_loss_curriculum_progress(self):
+        cfg = self.modality_cfg
+        if not self._mask_loss_curriculum_enabled():
+            return 0.0
+
+        start = cfg.mask_loss_warmup_updates
+        if self.current_num_updates <= start:
+            return 0.0
+
+        ramp = cfg.mask_loss_easy_to_hard_updates
+        if ramp <= 0:
+            return 1.0
+
+        return min(1.0, (self.current_num_updates - start) / ramp)
+
+    def _mask_loss_bin_weights(self, device, dtype):
+        bins = self.modality_cfg.mask_loss_bins
+        weights = torch.ones(bins, device=device, dtype=dtype)
+
+        if not self.mask_loss_bins_ready:
+            return weights / weights.sum()
+
+        loss = self.mask_loss_bin_ema.to(device=device, dtype=dtype)
+        seen = self.mask_loss_bin_count.to(device=device) > 0
+        if seen.any() and (~seen).any():
+            loss = torch.where(seen, loss, loss[seen].mean())
+
+        lo = loss.min()
+        hi = loss.max()
+        if (hi - lo).abs().item() < 1e-8:
+            return weights / weights.sum()
+
+        difficulty = (loss - lo) / (hi - lo)
+        progress = self._mask_loss_curriculum_progress()
+        easy = 1 - difficulty
+        hard = difficulty
+        weights = (1 - progress) * easy + progress * hard
+        weights = weights.clamp_min(1.0e-6)
+        return weights / weights.sum()
+
+    @torch.no_grad()
+    def update_mask_loss_bins(self, mask: torch.Tensor, token_loss: torch.Tensor):
+        if not self._mask_loss_curriculum_enabled():
+            return {}
+        if mask is None or token_loss is None or token_loss.numel() == 0:
+            return self.get_mask_curriculum_logs()
+
+        mask = mask.bool()
+        B, T = mask.shape
+
+        flat_count = int(mask.sum().item())
+        token_loss = token_loss.detach().float().view(-1)
+        if flat_count == 0 or token_loss.numel() != flat_count:
+            return self.get_mask_curriculum_logs()
+
+        bins = self.modality_cfg.mask_loss_bins
+        pos = torch.arange(T, device=mask.device)
+        bin_ids = torch.clamp((pos * bins) // max(T, 1), max=bins - 1)
+        flat_bins = bin_ids.unsqueeze(0).expand(B, -1)[mask]
+
+        bin_sum = torch.bincount(flat_bins, weights=token_loss, minlength=bins).float()
+        bin_cnt = torch.bincount(flat_bins, minlength=bins).float()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(bin_sum)
+            dist.all_reduce(bin_cnt)
+
+        seen = bin_cnt > 0
+        if seen.any():
+            batch_avg = torch.zeros_like(bin_sum)
+            batch_avg[seen] = bin_sum[seen] / bin_cnt[seen]
+            decay = self.modality_cfg.mask_loss_ema_decay
+
+            if not self.mask_loss_bins_ready:
+                self.mask_loss_bin_ema[seen] = batch_avg[seen]
+                self.mask_loss_bin_count[seen] = bin_cnt[seen]
+            else:
+                self.mask_loss_bin_ema[seen] = (
+                    decay * self.mask_loss_bin_ema[seen] + (1 - decay) * batch_avg[seen]
+                )
+                self.mask_loss_bin_count[seen] = (
+                    decay * self.mask_loss_bin_count[seen] + (1 - decay) * bin_cnt[seen]
+                )
+
+            self.mask_loss_bins_ready = True
+
+        return self.get_mask_curriculum_logs()
+
+    @torch.no_grad()
+    def get_mask_curriculum_logs(self):
+        if not self._mask_loss_curriculum_enabled():
+            return {}
+
+        logs = {
+            "mask_curriculum_progress": self._mask_loss_curriculum_progress(),
+            "mask_curriculum_ready": 1.0 if self.mask_loss_bins_ready else 0.0,
+        }
+
+        if self.mask_loss_bins_ready:
+            loss = self.mask_loss_bin_ema
+            logs["mask_curriculum_bin_loss_min"] = float(loss.min().item())
+            logs["mask_curriculum_bin_loss_max"] = float(loss.max().item())
+
+        return logs
+
+    def _compute_curriculum_mask(
+        self,
+        B,
+        T,
+        device,
+        padding_mask,
+        mask_prob,
+        mask_length,
+    ):
+        cfg = self.modality_cfg
+        mask = torch.zeros(
+            (B, T),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        pos_weights = self._mask_loss_bin_weights(mask.device, torch.float)
+        bin_ids = torch.clamp(
+            (torch.arange(T, device=mask.device) * cfg.mask_loss_bins) // max(T, 1),
+            max=cfg.mask_loss_bins - 1,
+        )
+        pos_weights = pos_weights[bin_ids]
+
+        explore = max(0.0, min(1.0, cfg.mask_loss_explore_pct))
+
+        for i in range(B):
+            valid_len = T
+            if padding_mask is not None:
+                valid_len = int((~padding_mask[i].bool()).sum().item())
+            if valid_len <= 0:
+                continue
+
+            target_mask = int(round(valid_len * mask_prob))
+            if mask_prob > 0 and target_mask == 0:
+                target_mask = 1
+            if target_mask <= 0:
+                continue
+
+            m = torch.zeros(valid_len, dtype=torch.bool, device=mask.device)
+            w = pos_weights[:valid_len]
+
+            if mask_length <= 1:
+                probs = w / w.sum()
+                if explore > 0:
+                    probs = (1 - explore) * probs + explore * (1.0 / probs.numel())
+                n = min(valid_len, target_mask)
+                if n > 0:
+                    idx = torch.multinomial(probs, n, replacement=False)
+                    m[idx] = True
+            else:
+                n_spans = max(1, int(round(valid_len * mask_prob / mask_length)))
+                n_starts = max(1, valid_len - mask_length + 1)
+                n_spans = min(n_spans, n_starts)
+
+                if valid_len >= mask_length:
+                    csum = torch.cat([w.new_zeros(1), torch.cumsum(w, dim=0)])
+                    span_scores = csum[mask_length:] - csum[:-mask_length]
+                    span_scores = span_scores / mask_length
+                else:
+                    span_scores = w.new_full((1,), w.mean())
+
+                probs = span_scores.clamp_min(1.0e-8)
+                probs = probs / probs.sum()
+                if explore > 0:
+                    probs = (1 - explore) * probs + explore * (1.0 / probs.numel())
+
+                starts = torch.multinomial(probs, n_spans, replacement=False)
+                for s in starts.tolist():
+                    e = min(valid_len, s + mask_length)
+                    m[s:e] = True
+
+            if cfg.mask_dropout > 0 and m.any():
+                masked_idx = torch.nonzero(m, as_tuple=False).flatten()
+                n_drop = min(
+                    masked_idx.numel(),
+                    int(round(masked_idx.numel() * cfg.mask_dropout)),
+                )
+                if n_drop > 0:
+                    drop_idx = masked_idx[
+                        torch.randperm(masked_idx.numel(), device=masked_idx.device)[
+                            :n_drop
+                        ]
+                    ]
+                    m[drop_idx] = False
+
+            n_masked = int(m.sum().item())
+            if n_masked > target_mask:
+                masked_idx = torch.nonzero(m, as_tuple=False).flatten()
+                to_unmask = masked_idx[
+                    torch.randperm(masked_idx.numel(), device=masked_idx.device)[
+                        : n_masked - target_mask
+                    ]
+                ]
+                m[to_unmask] = False
+            elif n_masked < target_mask:
+                unmasked_idx = torch.nonzero(~m, as_tuple=False).flatten()
+                n_add = min(unmasked_idx.numel(), target_mask - n_masked)
+                if n_add > 0:
+                    to_mask = unmasked_idx[
+                        torch.randperm(
+                            unmasked_idx.numel(), device=unmasked_idx.device
+                        )[:n_add]
+                    ]
+                    m[to_mask] = True
+
+            mask[i, :valid_len] = m
+
+        return mask
+
     def compute_mask(
         self,
         x,
@@ -368,7 +679,8 @@ class ModalitySpecificEncoder(nn.Module):
             B, T, C = x.shape
             cfg = self.modality_cfg
 
-            mask_prob = cfg.mask_prob
+            mask_prob = self.current_mask_prob
+            mask_length = self.current_mask_length
 
             if (
                 cfg.mask_prob_min is not None
@@ -378,29 +690,48 @@ class ModalitySpecificEncoder(nn.Module):
                 mask_prob = np.random.uniform(cfg.mask_prob_min, mask_prob)
 
             if mask_prob > 0:
-                if cfg.mask_length == 1:
+                if mask_length == 1:
                     mask_info = random_masking(x, mask_prob, mask_seed)
                 else:
+                    use_loss_curriculum = (
+                        self._mask_loss_curriculum_enabled()
+                        and self.current_num_updates >= cfg.mask_loss_warmup_updates
+                    )
+
                     if self.modality_cfg.inverse_mask:
                         mask_prob = 1 - mask_prob
 
-                    mask = compute_mask_indices(
-                        (B, T),
-                        padding_mask,
-                        mask_prob,
-                        cfg.mask_length,
-                        min_masks=1,
-                        require_same_masks=True,
-                        mask_dropout=cfg.mask_dropout,
-                        add_masks=cfg.add_masks,
-                        seed=mask_seed.seed if mask_seed is not None else None,
-                        epoch=mask_seed.update if mask_seed is not None else None,
-                        indices=mask_seed.ids if mask_seed is not None else None,
-                    )
+                    if use_loss_curriculum:
+                        mask = self._compute_curriculum_mask(
+                            B,
+                            T,
+                            x.device,
+                            padding_mask,
+                            mask_prob,
+                            mask_length,
+                        )
+                    else:
+                        mask = compute_mask_indices(
+                            (B, T),
+                            padding_mask,
+                            mask_prob,
+                            mask_length,
+                            min_masks=1,
+                            require_same_masks=True,
+                            mask_dropout=cfg.mask_dropout,
+                            add_masks=cfg.add_masks,
+                            seed=mask_seed.seed if mask_seed is not None else None,
+                            epoch=mask_seed.update if mask_seed is not None else None,
+                            indices=mask_seed.ids if mask_seed is not None else None,
+                        )
 
-                    mask = torch.from_numpy(mask).to(device=x.device)
+                        mask = torch.from_numpy(mask).to(device=x.device)
                     if self.modality_cfg.inverse_mask:
-                        mask = 1 - mask
+                        if padding_mask is None:
+                            mask = ~mask.bool()
+                        else:
+                            valid = ~padding_mask.bool()
+                            mask = (~mask.bool()) & valid
                     mask_info = self.make_maskinfo(x, mask)
             else:
                 mask_info = None

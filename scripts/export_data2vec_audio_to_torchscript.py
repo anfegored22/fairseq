@@ -181,7 +181,13 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        scripted = torch.jit.trace(wrapped, (dummy_source, dummy_lengths), strict=False)
+        wrapped(dummy_source, dummy_lengths)
+        scripted = torch.jit.trace(
+            wrapped,
+            (dummy_source, dummy_lengths),
+            strict=False,
+            check_trace=False,
+        )
         scripted = torch.jit.freeze(scripted)
 
     output_path = args.output

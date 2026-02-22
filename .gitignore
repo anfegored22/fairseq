@@ -142,3 +142,5 @@ outputs
 data/
 mlruns/
 tb/
+vad_shards_filtered/
+torchscript

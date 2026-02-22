@@ -185,6 +185,45 @@ The [full documentation](https://fairseq.readthedocs.io/) contains instructions
 for getting started, training new models and extending fairseq with new model
 types and tasks.
 
+# UPS data2vec curriculum experiments
+
+For local/single-device UPS experiments (including Mac M1), use the data2vec audio pretraining config with explicit MLflow CLI overrides.
+
+Preset configs:
+
+- Local/M1 preset: `examples/data2vec/config/audio/pretraining/ups_curriculum_local.yaml`
+- Single-GPU preset: `examples/data2vec/config/audio/pretraining/ups_curriculum_gpu.yaml`
+
+- Set MLflow experiment from CLI: `common.mlflow_experiment=data2vec_curriculum`
+- Set run name from dataset/split (examples):
+  - `common.mlflow_run_name=d2v_train_seed1`
+  - `common.mlflow_run_name=d2v_train_lang_ordered_seed1`
+  - `common.mlflow_run_name=d2v_multicorpus_seed1`
+- Log every training update: `common.log_interval=1`
+- Single-device defaults:
+  - `distributed_training.distributed_world_size=1`
+  - `common.cpu=true` and `common.fp16=false` (recommended for local Mac)
+
+Example command:
+
+```bash
+uv run fairseq-hydra-train \
+  --config-dir examples/data2vec/config/audio/pretraining \
+  --config-name ups_curriculum_local \
+  task.data=/Users/andres/ups-challenge/fairseq/data/ups_ps/manifests \
+  dataset.train_subset=train \
+  dataset.valid_subset=valid \
+  common.mlflow_tracking_uri=file:///Users/andres/ups-challenge/fairseq/mlruns \
+  common.mlflow_experiment=data2vec_curriculum \
+  common.mlflow_run_name=d2v_train_seed1 \
+  common.log_interval=1
+```
+
+Notes:
+
+- `common.log_interval=1` logs per update step (`num_updates`), not per epoch.
+- For language-batching comparisons, keep model/optimization settings fixed and only change `dataset.train_subset` (e.g., `train` vs `train_lang_ordered`).
+
 # Pre-trained models and examples
 
 We provide pre-trained models and pre-processed, binarized test sets for several tasks listed below,
